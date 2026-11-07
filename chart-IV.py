@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Vẽ đặc tuyến I-V realtime từ UART (macOS).
@@ -6,9 +5,12 @@ Vẽ đặc tuyến I-V realtime từ UART (macOS).
 Chức năng:
 - Nhấn nút RESET trên board -> sweep mới -> đồ thị tự xóa và vẽ lại.
 - Tự kết nối lại nếu cổng Serial bị mất.
-- Mỗi lần sweep xong ("SWEEP DONE") tự lưu CSV.
-- Hiển thị popup nếu INA219 BUS_OK = 0.
-- Chỉ hiển thị một popup cho mỗi đợt lỗi liên tục.
+- Mỗi lần sweep xong ("SWEEP DONE") tự lưu CSV và ảnh PNG (cùng tên).
+- Nếu INA219 BUS_OK = 0: hiện hộp thoại macOS gốc (chạy ở tiến trình riêng,
+  không dùng matplotlib, không dùng Tkinter, không chặn đồ thị).
+- Bấm Close trên hộp thoại chỉ đóng hộp thoại đó, đồ thị vẫn chạy.
+- Chỉ hiển thị một hộp thoại cho mỗi đợt lỗi liên tục.
+- Ctrl+C / nút Stop của PyCharm sẽ thoát êm.
 
 Cài đặt:
     pip3 install pyserial matplotlib
@@ -24,15 +26,15 @@ Chạy:
 import argparse
 import csv
 import glob
+import os
 import re
+import signal
+import subprocess
+import sys
 from datetime import datetime
-
 import matplotlib.pyplot as plt
 import serial
 import serial.tools.list_ports
-
-import tkinter as tk
-from tkinter import messagebox
 
 
 # ============================================================
@@ -110,15 +112,18 @@ def parse_line(line):
 # ============================================================
 # 4. LƯU DỮ LIỆU CSV
 # ============================================================
-
 def save_csv(data):
 
     if not data:
         return
 
-    name = datetime.now().strftime("iv_%Y%m%d_%H%M%S.csv")
+    result_dir = "results"
+    os.makedirs(result_dir, exist_ok=True)
 
-    with open(name, "w", newline="") as f:
+    base = datetime.now().strftime("iv_%Y%m%d_%H%M%S")
+    name = os.path.join(result_dir, f"{base}.csv")
+
+    with open(name, "w", newline="", encoding="utf-8-sig") as f:
 
         w = csv.DictWriter(
             f,
@@ -128,22 +133,103 @@ def save_csv(data):
         w.writeheader()
         w.writerows(data)
 
-    print(f"Đã lưu: {name}")
+    print(f"Đã lưu CSV: {name}")
+
+    return base
+
+def save_png(fig, base):
+    """Lưu ảnh đồ thị hiện tại vào folder result."""
+    result_dir = "results"
+    os.makedirs(result_dir, exist_ok=True)
+
+    name = os.path.join(result_dir, f"{base}.png")
+
+    try:
+        fig.canvas.draw()
+        fig.savefig(name, dpi=150, bbox_inches="tight")
+        print(f"Đã lưu ảnh: {name}")
+    except Exception as e:
+        print(f"Không lưu được ảnh: {e}")
 
 
 # ============================================================
-# 5. CHƯƠNG TRÌNH CHÍNH
+# 5. HỘP THOẠI LỖI (TIẾN TRÌNH RIÊNG, KHÔNG CHẶN CHƯƠNG TRÌNH)
+# ============================================================
+
+def show_bus_error_dialog(row):
+    """
+    Hiện hộp thoại macOS gốc bằng osascript, chạy ở tiến trình riêng.
+    Trả về đối tượng Popen (hoặc None nếu không phải macOS / lỗi).
+    Bấm Close chỉ đóng hộp thoại, không ảnh hưởng đồ thị.
+    """
+
+    if sys.platform != "darwin":
+        return None
+
+    msg = (
+        "Không thể đọc thanh ghi BUS Voltage!\n\n"
+        f"V_PA4: {row['vpa4']:.2f} V\n"
+        f"V_PA0: {row['vpa0']:.3f} V\n"
+        f"BUS_OK: {row['bus_ok']}\n\n"
+        "Vui lòng kiểm tra:\n"
+        "- Kết nối I2C (SCL/SDA)\n"
+        "- Nguồn cấp INA219\n"
+        "- Kết nối module cảm biến"
+    )
+
+    title = "INA219 Communication Error"
+
+    try:
+        return subprocess.Popen(
+            [
+                "osascript",
+                "-e", "on run argv",
+                "-e", (
+                    "display dialog (item 1 of argv) "
+                    "with title (item 2 of argv) "
+                    'buttons {"Close"} default button "Close" '
+                    "with icon stop"
+                ),
+                "-e", "end run",
+                msg,
+                title,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as e:
+        print(f"Không mở được hộp thoại lỗi: {e}")
+        return None
+
+
+def close_dialog(proc):
+    """Đóng hộp thoại nếu còn mở."""
+
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+# ============================================================
+# 6. CHƯƠNG TRÌNH CHÍNH
 # ============================================================
 
 def main():
 
-    # ---- Khởi tạo Tkinter để hiển thị popup ----
+    # ---- Bắt Ctrl+C / Stop để thoát êm ----
 
-    root = tk.Tk()
-    root.withdraw()
+    stop = {"flag": False}
 
-    # Cờ chống hiển thị popup liên tục
+    signal.signal(
+        signal.SIGINT,
+        lambda *_: stop.__setitem__("flag", True)
+    )
+
+    # Cờ chống mở hộp thoại liên tục + tiến trình hộp thoại
     bus_error_popup_shown = False
+    error_proc = None
 
     ap = argparse.ArgumentParser()
 
@@ -163,7 +249,7 @@ def main():
     args = ap.parse_args()
 
     # ========================================================
-    # 6. KHỞI TẠO ĐỒ THỊ
+    # 7. KHỞI TẠO ĐỒ THỊ
     # ========================================================
 
     plt.ion()
@@ -205,7 +291,7 @@ def main():
     fig.tight_layout()
 
     # ========================================================
-    # 7. HÀM CẬP NHẬT TRẠNG THÁI VÀ ĐỒ THỊ
+    # 8. HÀM CẬP NHẬT TRẠNG THÁI VÀ ĐỒ THỊ
     # ========================================================
 
     def set_status(status):
@@ -235,7 +321,7 @@ def main():
         fig.canvas.flush_events()
 
     # ========================================================
-    # 8. VÒNG LẶP CHÍNH
+    # 9. VÒNG LẶP CHÍNH
     # ========================================================
 
     data = []
@@ -248,10 +334,10 @@ def main():
 
     try:
 
-        while plt.fignum_exists(fig.number):
+        while plt.fignum_exists(fig.number) and not stop["flag"]:
 
             # ------------------------------------------------
-            # 8.1 KẾT NỐI / KẾT NỐI LẠI SERIAL
+            # 9.1 KẾT NỐI / KẾT NỐI LẠI SERIAL
             # ------------------------------------------------
 
             if ser is None:
@@ -292,7 +378,7 @@ def main():
                     continue
 
             # ------------------------------------------------
-            # 8.2 ĐỌC DỮ LIỆU UART
+            # 9.2 ĐỌC DỮ LIỆU UART
             # ------------------------------------------------
 
             try:
@@ -330,9 +416,90 @@ def main():
                 continue
 
             print(text)
-
             # ------------------------------------------------
-            # 8.3 XỬ LÝ KẾT THÚC SWEEP
+            # 9.2.1 XỬ LÝ INA219 DETECTED -- VẼ LẠI CHART
+            # ------------------------------------------------
+            if "INA219 DETECTED" in text:
+
+                print("[INFO] INA219 đã được nhận diện - Reset chart")
+
+                # Xóa dữ liệu sweep cũ
+                data.clear()
+
+                # Reset trạng thái sweep
+                sweep_done = False
+
+                # Reset trạng thái cảnh báo lỗi INA219
+                bus_error_popup_shown = False
+
+                # Đóng hộp thoại lỗi nếu đang mở
+                close_dialog(error_proc)
+                error_proc = None
+
+                # Xóa dữ liệu trên cả hai đồ thị
+                line1.set_data([], [])
+                line2.set_data([], [])
+
+                # Reset giới hạn trục tọa độ
+                for ax in (ax1, ax2):
+                    ax.relim()
+                    ax.autoscale_view()
+
+                # Cập nhật tiêu đề
+                set_status("INA219 DETECTED - sẵn sàng đo")
+
+                # Cập nhật giao diện ngay lập tức
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+
+                continue
+            # ------------------------------------------------
+            # 9.3b MỖI LẦN BẤM NÚT: SWEEP START / ABORTED / STOPPED
+            # ------------------------------------------------
+
+            if "SWEEP START" in text:
+
+                # Lần bấm mới: xóa đồ thị, cho phép hiện hộp thoại lỗi mới
+                data.clear()
+                sweep_done = False
+                bus_error_popup_shown = False
+
+                close_dialog(error_proc)
+                error_proc = None
+
+                set_status("bắt đầu sweep...")
+                redraw(data)
+
+                continue
+
+            if "SWEEP ABORTED" in text:
+
+                set_status(
+                    "sweep bị hủy do lỗi INA219 "
+                    "- bấm nút để thử lại"
+                )
+
+                redraw(data)
+
+                continue
+
+            if "SWEEP STOPPED" in text:
+
+                set_status(
+                    f"đã dừng thủ công ({len(data)} điểm) "
+                    "- bấm nút để đo lại"
+                )
+
+                continue
+            if "SWEEP PAUSED" in text:
+                set_status("TẠM DỪNG - nhấn USER BUTTON để tiếp tục")
+                continue
+
+            if "SWEEP CONTINUED" in text:
+                set_status("đang tiếp tục sweep...")
+                continue
+            # ------------------------------------------------
+            # 9.3 XỬ LÝ KẾT THÚC SWEEP
             # ------------------------------------------------
 
             if "SWEEP DONE" in text:
@@ -344,15 +511,17 @@ def main():
                     "- nhấn RESET để đo lại"
                 )
 
-                if data:
-                    save_csv(data)
-
+                # Vẽ lại trước để ảnh có đủ dữ liệu và tiêu đề trạng thái
                 redraw(data)
+
+                if data:
+                    base = save_csv(data)
+                    save_png(fig, base)
 
                 continue
 
             # ------------------------------------------------
-            # 8.4 PHÂN TÍCH DỮ LIỆU
+            # 9.4 PHÂN TÍCH DỮ LIỆU
             # ------------------------------------------------
 
             row = parse_line(text)
@@ -361,7 +530,7 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # 8.5 KIỂM TRA LỖI INA219 BUS
+            # 9.5 KIỂM TRA LỖI INA219 BUS
             # ------------------------------------------------
 
             if row["bus_ok"] == 0:
@@ -372,26 +541,12 @@ def main():
                     f"BUS_OK={row['bus_ok']}"
                 )
 
-                # Chỉ hiển thị một popup trong một đợt lỗi
+                # Chỉ mở một hộp thoại cho mỗi đợt lỗi liên tục
                 if not bus_error_popup_shown:
                     bus_error_popup_shown = True
+                    error_proc = show_bus_error_dialog(row)
 
-                    messagebox.showerror(
-                        "INA219 Communication Error",
-                        "Không thể đọc thanh ghi BUS Voltage!\n\n"
-                        f"V_PA4: {row['vpa4']:.2f} V\n"
-                        f"V_PA0: {row['vpa0']:.3f} V\n"
-                        f"BUS_OK: {row['bus_ok']}\n\n"
-                        "Vui lòng kiểm tra:\n"
-                        "- Kết nối I2C (SCL/SDA)\n"
-                        "- Nguồn cấp INA219\n"
-                        "- Kết nối module cảm biến\n\n"
-                        "Chương trình đã thoát.",
-                        parent=root
-                    )
-
-                # Bỏ qua mẫu lỗi, KHÔNG thoát chương trình
-                plt.close("all")
+                # Bỏ qua mẫu lỗi, đồ thị vẫn chạy bình thường
                 continue
 
             else:
@@ -399,8 +554,12 @@ def main():
                 # BUS đọc thành công trở lại
                 bus_error_popup_shown = False
 
+                # Tự đóng hộp thoại lỗi nếu còn mở
+                close_dialog(error_proc)
+                error_proc = None
+
             # ------------------------------------------------
-            # 8.6 PHÁT HIỆN SWEEP MỚI
+            # 9.6 PHÁT HIỆN SWEEP MỚI
             # ------------------------------------------------
 
             if (
@@ -420,7 +579,7 @@ def main():
                 )
 
             # ------------------------------------------------
-            # 8.7 CẬP NHẬT DỮ LIỆU VÀ ĐỒ THỊ
+            # 9.7 CẬP NHẬT DỮ LIỆU VÀ ĐỒ THỊ
             # ------------------------------------------------
 
             data.append(row)
@@ -435,8 +594,10 @@ def main():
     finally:
 
         # ----------------------------------------------------
-        # 8.8 GIẢI PHÓNG TÀI NGUYÊN
+        # 9.8 GIẢI PHÓNG TÀI NGUYÊN
         # ----------------------------------------------------
+
+        close_dialog(error_proc)
 
         if ser is not None:
 
@@ -445,11 +606,14 @@ def main():
             except Exception:
                 pass
 
-        root.destroy()
+        try:
+            plt.close("all")
+        except Exception:
+            pass
 
 
 # ============================================================
-# 9. ENTRY POINT
+# 10. ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":

@@ -67,10 +67,9 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 static float current_offset_A = 0.0f;   // offset dòng (A), đo lúc bắt đầu sweep
 volatile uint8_t button_event = 0;
 volatile uint8_t measurement_running = 0;
-volatile uint8_t sweep_running = 1;
+volatile uint8_t measurement_paused = 0;
 static volatile uint32_t last_button_tick = 0;
 uint32_t sweep_index = 0;
-HAL_StatusTypeDef result;
 
 /* USER CODE END PV */
 
@@ -127,6 +126,23 @@ static uint8_t INA219_ReadCurrent_A(float *i_A) {
 	return 1;
 }
 
+// Đọc V_BUS (V) từ INA219. Trả về 1 nếu OK
+static uint8_t INA219_ReadBusVoltage_V(float *v_bus) {
+	uint16_t raw_bus = INA219_ReadRegister(INA219_REG_BUS_VOLTAGE);
+	if (raw_bus == 0xFFFF)
+		return 0;
+	*v_bus = (raw_bus >> 3) * 0.004f;
+	return 1;
+}
+
+// Khởi tạo lại I2C2 để thoát trạng thái treo sau lỗi
+static void INA219_I2C_Recover(void) {
+	HAL_I2C_DeInit(&hi2c2);
+	HAL_I2C_Init(&hi2c2);
+	HAL_I2CEx_ConfigAnalogFilter(&hi2c2, I2C_ANALOGFILTER_ENABLE);
+	HAL_I2CEx_ConfigDigitalFilter(&hi2c2, 0);
+}
+
 // Trung bình n mẫu dòng (A). Delay 1 ms để INA219 kịp có kết quả chuyển đổi mới
 static float INA219_ReadCurrentAvg_A(uint16_t n) {
 	float sum = 0.0f;
@@ -167,6 +183,20 @@ void Calibrate_Current_Offset(void) {
 int __io_putchar(int ch) {
 	HAL_UART_Transmit(&huart3, (uint8_t*) &ch, 1, 100);
 	return ch;
+}
+
+// Gửi 1 dòng dữ liệu (LUÔN trên 1 dòng duy nhất, kết thúc bằng \r\n)
+static void UART_SendDataLine(float v_set, uint32_t adc_raw, float v_pa0,
+		float i_mA, float v_bus, uint8_t bus_ok) {
+	char msg[200];
+	int len =
+			snprintf(msg, sizeof(msg),
+					"V_PA4=%.2f V | V_PA0_RAW=%lu | V_PA0=%.3f V | I=%.3f mA | V_BUS=%.3f V | BUS_OK=%u\r\n",
+					v_set, (unsigned long) adc_raw, v_pa0, i_mA, v_bus, bus_ok);
+
+	if (len > 0 && len < (int) sizeof(msg)) {
+		HAL_UART_Transmit(&huart3, (uint8_t*) msg, (uint16_t) len, 1000);
+	}
 }
 
 /* USER CODE END 0 */
@@ -210,31 +240,18 @@ int main(void) {
 	MX_I2C2_Init();
 	/* USER CODE BEGIN 2 */
 
-	float v_bus = 0.0f;
-
 	HAL_Delay(10);
 	volatile HAL_StatusTypeDef result;
 
 	result = HAL_I2C_IsDeviceReady(&hi2c2, (uint16_t) (0x40 << 1), 3, 100);
 	if (result == HAL_OK) {
 		printf("INA219 DETECTED\r\n");
-		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   // LED xanh
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   // LED
 	} else {
-		uint32_t t_led = HAL_GetTick();
-		uint32_t t_flag = HAL_GetTick();
-
-		while (1) {
-			uint32_t now = HAL_GetTick();
-
-			if (now - t_led >= 250) {            // chớp LED đỏ mỗi 250ms
-				t_led = now;
-				HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
-			}
-
-			if (now - t_flag >= 1000) {          // gửi lại cờ mỗi 1s
-				t_flag = now;
-			}
-		}
+		// KHÔNG kẹt vòng lặp nữa: vẫn cho phép bấm nút,
+		// mỗi lần bấm sẽ báo lỗi INA219 lên Python.
+		printf("INA219 NOT FOUND\r\n");
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
 	}
 
 	HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
@@ -243,22 +260,81 @@ int main(void) {
 
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
-	while (sweep_running) {
+	while (1) {
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
 		if (button_event == 1) {
+
 			button_event = 0;
-			measurement_running = !measurement_running;
 
-			if (measurement_running) {
-				// 1. Xả điện áp + đo offset dòng
-				Calibrate_Current_Offset();
+			// =========================================
+			// TRẠNG THÁI 1: IDLE -> START
+			// =========================================
+			if (!measurement_running && !measurement_paused) {
 
-				// 2. Bắt đầu sweep I-V
-				sweep_index = 0;
-			} else {
-				DAC_SetVoltage(0.0f);     // dừng thì về 0 V
+				measurement_running = 1;
+
+				printf("SWEEP START\r\n");
+
+				float v_chk;
+
+				uint8_t ok = INA219_ReadBusVoltage_V(&v_chk);
+
+				if (!ok) {
+					INA219_I2C_Recover();
+					ok = INA219_ReadBusVoltage_V(&v_chk);
+				}
+
+				if (!ok) {
+
+					measurement_running = 0;
+					measurement_paused = 0;
+
+					DAC_SetVoltage(0.0f);
+
+					uint32_t adc_raw = ADC1_ReadAvg(1);
+					float v_pa0 = ((float) adc_raw * 3.3f) / 4095.0f;
+
+					UART_SendDataLine(0.0f, adc_raw, v_pa0, 0.0f, -1.0f, 0);
+
+					printf("SWEEP ABORTED\r\n");
+
+				} else {
+
+					Calibrate_Current_Offset();
+
+					sweep_index = 0;
+
+					printf("SWEEP READY\r\n");
+				}
+			}
+
+			// =========================================
+			// TRẠNG THÁI 2: RUNNING -> PAUSE
+			// =========================================
+			else if (measurement_running) {
+
+				measurement_running = 0;
+				measurement_paused = 1;
+
+				// Giữ nguyên điện áp DAC hiện tại
+				printf("SWEEP PAUSED\r\n");
+			}
+
+			// =========================================
+			// TRẠNG THÁI 3: PAUSED -> CONTINUE
+			// =========================================
+			else if (measurement_paused) {
+
+				measurement_paused = 0;
+				measurement_running = 1;
+
+				// Không reset sweep_index
+				// Không hiệu chuẩn lại offset
+				// Tiếp tục tại bước đang dở
+
+				printf("SWEEP CONTINUED\r\n");
 			}
 		}
 
@@ -272,40 +348,26 @@ int main(void) {
 			uint32_t adc_raw = ADC1_ReadAvg(ADC_AVG_SAMPLES);
 			float v_pa0 = ((float) adc_raw * 3.3f) / 4095.0f;
 
-			// 3. Đọc INA219: dòng (trung bình, đã trừ offset) và V_BUS
+			// 3. Đọc V_BUS trước: lỗi thì huỷ ngay, không đọc dòng (tránh chờ timeout)
+			float v_bus = -1.0f;
+			uint8_t bus_ok = INA219_ReadBusVoltage_V(&v_bus);
+
+			if (!bus_ok) {
+				measurement_running = 0;
+				DAC_SetVoltage(0.0f);
+
+				UART_SendDataLine(v_set, adc_raw, v_pa0, 0.0f, -1.0f, 0);
+				printf("SWEEP ABORTED\r\n");
+				continue;               // về đầu vòng lặp, chờ lần bấm sau
+			}
+
+			// 4. Đọc dòng (trung bình, đã trừ offset)
 			float i_A = INA219_ReadCurrentAvg_A(AVG_SAMPLES) - current_offset_A;
 
-			uint16_t raw_bus = INA219_ReadRegister(INA219_REG_BUS_VOLTAGE);
-			uint8_t bus_ok = (raw_bus != 0xFFFF);
+			// 5. Gửi UART (1 dòng)
+			UART_SendDataLine(v_set, adc_raw, v_pa0, i_A * 1000.0f, v_bus, 1);
 
-			if (bus_ok) {
-				v_bus = (raw_bus >> 3) * 0.004f;
-			} else {
-				v_bus = -1.0f;
-				// INA219 lỗi: dừng quá trình quét
-				sweep_running = 0;
-
-				// Đưa DAC về 0V
-				HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 0);
-
-				v_set = 0.0f;
-
-			}
-
-			// 4. Gửi UART
-			char msg[200];
-			int len =
-					snprintf(msg, sizeof(msg),
-							"V_PA4=%.2f V | V_PA0_RAW=%lu | V_PA0=%.3f V | I=%.3f mA | V_BUS=%.3f V | BUS_OK=%u\r\n",
-							v_set, (unsigned long) adc_raw, v_pa0,
-							i_A * 1000.0f, v_bus, bus_ok);
-
-			if (len > 0 && len < (int) sizeof(msg)) {
-				HAL_UART_Transmit(&huart3, (uint8_t*) msg, (uint16_t) len,
-						1000);
-			}
-
-			// 5. Sang bước tiếp theo, hết dải thì dừng
+			// 6. Sang bước tiếp theo, hết dải thì dừng
 			sweep_index++;
 			if (sweep_index > SWEEP_STEPS) {
 				measurement_running = 0;
